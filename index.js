@@ -12,69 +12,51 @@ const banPath = [
 
 // 数据库初始化
 async function initDatabase() {
-  try {
-    // 创建表
+  // 创建表
+  await DB.prepare(`
+    CREATE TABLE IF NOT EXISTS mappings (
+      path TEXT PRIMARY KEY,
+      target TEXT NOT NULL,
+      name TEXT,
+      expiry TEXT,
+      enabled INTEGER DEFAULT 1,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+
+  // 检查是否需要添加新列
+  const tableInfo = await DB.prepare("PRAGMA table_info(mappings)").all();
+  const columns = tableInfo.results.map(col => col.name);
+
+  // 添加 isWechat 列（如果不存在）
+  if (!columns.includes('isWechat')) {
     await DB.prepare(`
-      CREATE TABLE IF NOT EXISTS mappings (
-        path TEXT PRIMARY KEY,
-        target TEXT NOT NULL,
-        name TEXT,
-        expiry TEXT,
-        enabled INTEGER DEFAULT 1,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-      )
+      ALTER TABLE mappings 
+      ADD COLUMN isWechat INTEGER DEFAULT 0
     `).run();
-
-    // 检查是否需要添加新列
-    const tableInfo = await DB.prepare("PRAGMA table_info(mappings)").all();
-    const columns = tableInfo.results.map(col => col.name);
-
-    // 添加 isWechat 列（如果不存在）
-    // 使用 try-catch 忽略"列已存在"的错误，防止并发请求导致的 1101 错误
-    if (!columns.includes('isWechat')) {
-      try {
-        await DB.prepare(`
-          ALTER TABLE mappings 
-          ADD COLUMN isWechat INTEGER DEFAULT 0
-        `).run();
-      } catch (e) {
-        console.log('Column isWechat might already exist, ignoring:', e);
-      }
-    }
-
-    // 添加 qrCodeData 列（如果不存在）
-    if (!columns.includes('qrCodeData')) {
-      try {
-        await DB.prepare(`
-          ALTER TABLE mappings 
-          ADD COLUMN qrCodeData TEXT
-        `).run();
-      } catch (e) {
-        console.log('Column qrCodeData might already exist, ignoring:', e);
-      }
-    }
-
-    // 添加索引 (使用 try-catch 防止重复创建报错，尽管 SQL 中有 IF NOT EXISTS，但在某些 D1 版本中仍可能抛出异常)
-    try {
-      await DB.prepare(`
-        CREATE INDEX IF NOT EXISTS idx_expiry ON mappings(expiry)
-      `).run();
-
-      await DB.prepare(`
-        CREATE INDEX IF NOT EXISTS idx_created_at ON mappings(created_at)
-      `).run();
-
-      // 组合索引：用于启用状态和过期时间的组合查询
-      await DB.prepare(`
-        CREATE INDEX IF NOT EXISTS idx_enabled_expiry ON mappings(enabled, expiry)
-      `).run();
-    } catch (e) {
-      console.log('Index creation error (likely exists), ignoring:', e);
-    }
-  } catch (error) {
-    console.error('Fatal Database Initialization Error:', error);
-    throw error; // 抛出给主函数处理
   }
+
+  // 添加 qrCodeData 列（如果不存在）
+  if (!columns.includes('qrCodeData')) {
+    await DB.prepare(`
+      ALTER TABLE mappings 
+      ADD COLUMN qrCodeData TEXT
+    `).run();
+  }
+
+  // 添加索引
+  await DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_expiry ON mappings(expiry)
+  `).run();
+
+  await DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_created_at ON mappings(created_at)
+  `).run();
+
+  // 组合索引：用于启用状态和过期时间的组合查询
+  await DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_enabled_expiry ON mappings(enabled, expiry)
+  `).run();
 }
 
 // Cookie 相关函数
@@ -250,6 +232,7 @@ async function getExpiringMappings() {
   // 获取今天的日期（设置为今天的23:59:59）
   const today = new Date();
   today.setHours(23, 59, 59, 999);
+  const now = today.toISOString();
   
   // 获取今天的开始时间（00:00:00）
   const todayStart = new Date();
@@ -306,24 +289,77 @@ async function getExpiringMappings() {
   return mappings;
 }
 
-export default {
-  async fetch(request, env) {
-    // 关键修复：检查 DB 是否存在
-    if (!env.DB) {
-      console.error('Environment Error: "DB" binding not found. Check wrangler.toml.');
-      return new Response('Server Configuration Error: Database not bound.', { status: 500 });
+// 添加新的批量清理过期映射的函数
+async function cleanupExpiredMappings(batchSize = 100) {
+  const now = new Date().toISOString();
+  
+  while (true) {
+    // 获取一批过期的映射
+    const batch = await DB.prepare(`
+      SELECT path 
+      FROM mappings 
+      WHERE expiry IS NOT NULL 
+        AND expiry < ? 
+      LIMIT ?
+    `).bind(now, batchSize).all();
+
+    if (!batch.results || batch.results.length === 0) {
+      break;
     }
 
+    // 批量删除这些映射
+    const paths = batch.results.map(row => row.path);
+    const placeholders = paths.map(() => '?').join(',');
+    await DB.prepare(`
+      DELETE FROM mappings 
+      WHERE path IN (${placeholders})
+    `).bind(...paths).run();
+
+    // 如果获取的数量小于 batchSize，说明已经处理完所有过期映射
+    if (batch.results.length < batchSize) {
+      break;
+    }
+  }
+}
+
+// 数据迁移函数
+async function migrateFromKV() {
+  let cursor = null;
+  do {
+    const listResult = await KV_BINDING.list({ cursor, limit: 1000 });
+    
+    for (const key of listResult.keys) {
+      if (!banPath.includes(key.name)) {
+        const value = await KV_BINDING.get(key.name, { type: "json" });
+        if (value) {
+          try {
+            await createMapping(
+              key.name,
+              value.target,
+              value.name,
+              value.expiry,
+              value.enabled,
+              value.isWechat,
+              value.qrCodeData
+            );
+          } catch (e) {
+            console.error(`Failed to migrate ${key.name}:`, e);
+          }
+        }
+      }
+    }
+    
+    cursor = listResult.cursor;
+  } while (cursor);
+}
+
+export default {
+  async fetch(request, env) {
     KV_BINDING = env.KV_BINDING;
     DB = env.DB;
     
-    // 关键修复：捕捉初始化错误
-    try {
-      await initDatabase();
-    } catch (dbError) {
-      console.error('Database Initialization Failed:', dbError);
-      return new Response('Database Initialization Error: ' + dbError.message, { status: 500 });
-    }
+    // 初始化数据库
+    await initDatabase();
     
     const url = new URL(request.url);
     const path = url.pathname.slice(1);
@@ -335,30 +371,30 @@ export default {
 
     // API 路由处理
     if (path.startsWith('api/')) {
-      try {
-        // 登录 API
-        if (path === 'api/login' && request.method === 'POST') {
-          const { password } = await request.json();
-          if (password === env.PASSWORD) {
-            return new Response(JSON.stringify({ success: true }), {
-              headers: setAuthCookie(password)
-            });
-          }
-          return new Response('Unauthorized', { status: 401 });
-        }
-
-        // 登出 API
-        if (path === 'api/logout' && request.method === 'POST') {
+      // 登录 API
+      if (path === 'api/login' && request.method === 'POST') {
+        const { password } = await request.json();
+        if (password === env.PASSWORD) {
           return new Response(JSON.stringify({ success: true }), {
-            headers: clearAuthCookie()
+            headers: setAuthCookie(password)
           });
         }
+        return new Response('Unauthorized', { status: 401 });
+      }
 
-        // 需要认证的 API
-        if (!verifyAuthCookie(request, env)) {
-          return new Response('Unauthorized', { status: 401 });
-        }
+      // 登出 API
+      if (path === 'api/logout' && request.method === 'POST') {
+        return new Response(JSON.stringify({ success: true }), {
+          headers: clearAuthCookie()
+        });
+      }
 
+      // 需要认证的 API
+      if (!verifyAuthCookie(request, env)) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+
+      try {
         // 获取即将过期和已过期的映射
         if (path === 'api/expiring-mappings') {
           const result = await getExpiringMappings();
@@ -675,33 +711,23 @@ export default {
   },
 
   async scheduled(controller, env, ctx) {
-    // 同样为定时任务添加检查
-    if (!env.DB) {
-      console.error('Scheduled Task Error: "DB" binding not found.');
-      return;
-    }
-    
     KV_BINDING = env.KV_BINDING;
     DB = env.DB;
     
-    try {
-      // 初始化数据库
-      await initDatabase();
-          
-      // 获取过期和即将过期的映射报告
-      const result = await getExpiringMappings();
+    // 初始化数据库
+    await initDatabase();
+        
+    // 获取过期和即将过期的映射报告
+    const result = await getExpiringMappings();
 
-      console.log(`Cron job report: Found ${result.expired.length} expired mappings`);
-      if (result.expired.length > 0) {
-        console.log('Expired mappings:', JSON.stringify(result.expired, null, 2));
-      }
+    console.log(`Cron job report: Found ${result.expired.length} expired mappings`);
+    if (result.expired.length > 0) {
+      console.log('Expired mappings:', JSON.stringify(result.expired, null, 2));
+    }
 
-      console.log(`Found ${result.expiring.length} mappings expiring in 2 days`);
-      if (result.expiring.length > 0) {
-        console.log('Expiring soon mappings:', JSON.stringify(result.expiring, null, 2));
-      }
-    } catch (error) {
-       console.error('Scheduled Task Failed:', error);
+    console.log(`Found ${result.expiring.length} mappings expiring in 2 days`);
+    if (result.expiring.length > 0) {
+      console.log('Expiring soon mappings:', JSON.stringify(result.expiring, null, 2));
     }
   },
 
